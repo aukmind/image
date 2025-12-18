@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="logo.svg">
+    <title>Aukmind Image Converter</title>
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+
+    <!-- Dependencies -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+    <!-- Vue 3 & Naive UI -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/naive-ui"></script>
+    <script src="/naive-ui-theme.js"></script>
+</head>
+<body>
+    <div id="app" v-cloak>
+        <n-config-provider :theme-overrides="theme">
+            <n-message-provider>
+                <image-app></image-app>
+            </n-message-provider>
+        </n-config-provider>
+    </div>
+
+    <template id="image-app-template">
+        <div class="app-container">
+            <div class="app-card">
+                <header class="app-header">
+                    <div class="app-header__brand">
+                        <div class="app-header__logo">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M19.428 15.428a2 2 0 00-1.022-.547l-2.384-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
+                            </svg>
+                        </div>
+                        <div>
+                            <h1>Aukmind Image Converter</h1>
+                            <p>Local & Secure Image Processing</p>
+                        </div>
+                    </div>
+                    <n-tag v-if="isReady" type="success" round size="small">Engine Ready</n-tag>
+                </header>
+
+                <div class="main-layout">
+                    <!-- Left: Inputs -->
+                    <section class="panel panel--input">
+                        <h2 class="panel__title">
+                            <n-tag type="info" round size="small">1</n-tag>
+                            Input images
+                        </h2>
+
+                        <div :class="['dropzone', { 'dropzone--active': isDragging, 'dropzone--filled': files.length > 0 }]"
+                             @dragover.prevent="isDragging = true"
+                             @dragleave.prevent="isDragging = false"
+                             @drop.prevent="onDrop">
+                            <input type="file" multiple class="dropzone__input"
+                                accept="image/*,application/pdf"
+                                @change="e => addFiles(e.target.files)" />
+
+                            <div v-if="files.length === 0" class="dropzone__empty">
+                                <div class="dropzone__icon">
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                    </svg>
+                                </div>
+                                <p>Drop files here or click to upload</p>
+                            </div>
+
+                            <div v-else class="thumb-grid">
+                                <div v-for="file in files" :key="file.id" class="thumb">
+                                    <img v-if="!file.renderError" :src="file.preview"
+                                        :style="{ transform: `rotate(${rotation}deg)` }"
+                                        @error="handlePreviewError(file)" />
+                                    <div v-else class="thumb__fallback">
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                                        </svg>
+                                        <span>{{ file.file.name }}</span>
+                                    </div>
+                                    <button class="thumb__remove" @click.stop.prevent="removeFile(file.id)" title="Remove">×</button>
+                                </div>
+                                <div class="thumb thumb--add">+</div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Right: Options -->
+                    <section class="panel panel--options">
+                        <h2 class="panel__title">
+                            <n-tag type="info" round size="small">2</n-tag>
+                            Options
+                        </h2>
+
+                        <div class="options-stack">
+                            <div class="field">
+                                <label class="field__label">Format & Compression</label>
+                                <div class="format-buttons">
+                                    <button
+                                        v-for="fmt in quickFormatList"
+                                        :key="fmt.value"
+                                        type="button"
+                                        :class="['format-btn', { 'format-btn--active': targetFormat === fmt.value }]"
+                                        @click="targetFormat = fmt.value">
+                                        {{ fmt.label }}
+                                    </button>
+                                    <select
+                                        :class="['format-btn', 'format-btn--select', { 'format-btn--active': isExtraFormatActive }]"
+                                        :value="isExtraFormatActive ? targetFormat : ''"
+                                        @change="e => targetFormat = e.target.value">
+                                        <option value="" disabled>More…</option>
+                                        <option v-for="fmt in extraFormatOptions" :key="fmt.value" :value="fmt.value">
+                                            {{ fmt.label }}
+                                        </option>
+                                    </select>
+                                </div>
+                                <div class="slider-row">
+                                    <span class="slider-row__name">Quality</span>
+                                    <div class="slider-row__slider">
+                                        <n-slider v-model:value="quality" :min="1" :max="100" :step="1" />
+                                    </div>
+                                    <span class="slider-row__value">{{ quality }}%</span>
+                                </div>
+                            </div>
+
+                            <div v-if="canMergeAnimation" class="callout">
+                                <div class="callout__row">
+                                    <n-switch v-model:value="makeAnimation" />
+                                    <span class="callout__label">
+                                        Merge into Animation
+                                        <span class="callout__sub">(GIF / WebP only)</span>
+                                    </span>
+                                </div>
+                                <div v-if="makeAnimation" class="callout__detail">
+                                    <label>Frame Delay (ms)</label>
+                                    <n-input-number v-model:value="animationDelay" :min="10" :max="10000" size="small" placeholder="e.g. 200" />
+                                </div>
+                            </div>
+
+                            <div v-if="files.length > 1 && !isMultiFrameFormat" class="hint">
+                                Animation is only available for GIF and WebP formats.
+                            </div>
+
+                            <div class="field">
+                                <label class="field__label">Edit Image</label>
+                                <div class="edit-card">
+                                    <div class="rotate-row">
+                                        <button type="button" class="format-btn" @click="rotateLeft">↶ Rotate Left</button>
+                                        <span class="rotate-row__angle">{{ rotation }}°</span>
+                                        <button type="button" class="format-btn" @click="rotateRight">Rotate Right ↷</button>
+                                    </div>
+
+                                    <div class="resize-section">
+                                        <div class="resize-header">
+                                            <label class="field__sublabel resize-header__label">Resize</label>
+                                            <div class="seg-control">
+                                                <button v-for="opt in resizeModeOptions" :key="opt.value"
+                                                    type="button"
+                                                    :class="['format-btn', { 'format-btn--active': resizeMode === opt.value }]"
+                                                    @click="resizeMode = opt.value">
+                                                    {{ opt.label }}
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div v-if="resizeMode === 'percent'" class="slider-row">
+                                            <div class="slider-row__slider">
+                                                <n-slider v-model:value="resizePercent" :min="1" :max="200" />
+                                            </div>
+                                            <span class="slider-row__value">{{ resizePercent }}%</span>
+                                        </div>
+
+                                        <div v-if="resizeMode === 'pixels'" class="resize-pixels">
+                                            <div class="resize-pixels__inputs">
+                                                <div>
+                                                    <label>W</label>
+                                                    <n-input-number v-model:value="resizeWidth" placeholder="Auto" :min="1" size="small" />
+                                                </div>
+                                                <div>
+                                                    <label>H</label>
+                                                    <n-input-number v-model:value="resizeHeight" placeholder="Auto" :min="1" size="small" />
+                                                </div>
+                                            </div>
+                                            <button type="button"
+                                                :class="['format-btn', 'format-btn--full', { 'format-btn--active': lockRatio }]"
+                                                @click="lockRatio = !lockRatio">
+                                                🔒 {{ lockRatio ? 'Ratio Locked' : 'Ratio Unlocked' }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <n-alert v-if="errorMessage" type="error" closable @close="errorMessage = ''">
+                                {{ errorMessage }}
+                            </n-alert>
+                        </div>
+
+                        <n-button type="primary" size="large" block strong class="convert-btn"
+                            :disabled="files.length === 0 || processing"
+                            @click="convertAndDownload">
+                            <span v-if="processing">Running...</span>
+                            <span v-else>{{ makeAnimation ? 'Create Animation' : 'Convert Images' }}</span>
+                        </n-button>
+                    </section>
+                </div>
+            </div>
+
+            <div v-if="processing" class="progress-bar">
+                <div class="progress-bar__inner">
+                    <div class="progress-bar__row">
+                        <span>{{ progressLabel }}</span>
+                        <span>{{ Math.round(progress) }}%</span>
+                    </div>
+                    <n-progress type="line" :percentage="progress" :show-indicator="false" status="success" />
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <script type="module" src="image-handler.js"></script>
+    <script type="module" src="app.js"></script>
+</body>
+</html>
