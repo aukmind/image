@@ -4,7 +4,9 @@ import {
   initializeImageMagick,
   ImageMagick,
   MagickFormat,
-  MagickGeometry
+  MagickGeometry,
+  MagickImage,
+  MagickImageCollection
 } from '@imagemagick/magick-wasm';
 import JSZip from 'jszip';
 
@@ -18,6 +20,10 @@ const targetFormat = ref(MagickFormat.Png);
 const zipOutput = ref(false);
 const errorMessage = ref('');
 const isDragging = ref(false);
+
+// --- Animation State ---
+const makeAnimation = ref(false);
+const animationDelay = ref(200); // ms
 
 // --- Editor State ---
 const resizeMode = ref('none');
@@ -53,6 +59,25 @@ const extraFormats = {
 const isMoreSelected = computed(() => Object.values(extraFormats).includes(targetFormat.value));
 const currentMoreLabel = computed(() => Object.keys(extraFormats).find(key => extraFormats[key] === targetFormat.value));
 
+// --- Animation Logic Update ---
+// APNG requires FFMPEG delegate which is missing in WASM. 
+// We strictly allow only GIF and WEBP for animations.
+const canAnimate = computed(() => {
+  if (files.value.length < 2) return false;
+  const animatableFormats = [MagickFormat.Gif, MagickFormat.WebP];
+  return animatableFormats.includes(targetFormat.value);
+});
+
+// Auto-disable animation if format changes to non-supported
+watch(targetFormat, () => {
+  if (!canAnimate.value) makeAnimation.value = false;
+});
+
+watch(() => files.value.length, (newCount) => {
+  if (newCount > 1 && !makeAnimation.value) zipOutput.value = true;
+  if (newCount < 2) makeAnimation.value = false;
+});
+
 const selectFormat = (format) => {
   targetFormat.value = format;
   showMoreDropdown.value = false;
@@ -69,10 +94,6 @@ onMounted(async () => {
   } catch (e) {
     errorMessage.value = "Failed to load Magick: " + e.message;
   }
-});
-
-watch(() => files.value.length, (newCount) => {
-  if (newCount > 1) zipOutput.value = true;
 });
 
 const closeDropdown = () => { showMoreDropdown.value = false; };
@@ -110,10 +131,7 @@ const convertAndDownload = async () => {
   errorMessage.value = '';
 
   try {
-    const zip = new JSZip();
-    const processedFiles = [];
-    const totalFiles = files.value.length;
-
+    // Determine extension
     let ext = 'dat';
     const quickKey = Object.keys(quickFormats).find(key => quickFormats[key] === targetFormat.value);
     if (quickKey) ext = quickKey.toLowerCase();
@@ -121,33 +139,53 @@ const convertAndDownload = async () => {
     if (extraKey) ext = extraKey.toLowerCase();
     if (ext === 'jpeg') ext = 'jpg';
 
-    for (let i = 0; i < totalFiles; i++) {
-      const item = files.value[i];
-      progressLabel.value = `Processing ${item.file.name}...`;
-
-      const convertedBlob = await processSingleImage(item.file);
-      const newName = item.file.name.replace(/\.[^/.]+$/, "") + '.' + ext;
-
-      processedFiles.push({ name: newName, blob: convertedBlob });
-      progress.value = ((i + 1) / totalFiles) * 90;
+    // --- Branch A: Create Animation ---
+    if (makeAnimation.value && canAnimate.value) {
+      progressLabel.value = "Building Animation...";
+      const blob = await processAnimation();
+      progress.value = 100;
+      triggerDownload(blob, `animation.${ext}`);
     }
 
-    if (zipOutput.value || totalFiles > 1) {
-      progressLabel.value = "Compressing...";
-      processedFiles.forEach(f => zip.file(f.name, f.blob));
-      const content = await zip.generateAsync({ type: "blob" }, (metadata) => {
-        progress.value = 90 + (metadata.percent * 0.1);
-      });
-      triggerDownload(content, "converted_images.zip");
-    } else {
-      progressLabel.value = "Finalizing...";
-      progress.value = 100;
-      triggerDownload(processedFiles[0].blob, processedFiles[0].name);
+    // --- Branch B: Standard Processing (Single or Batch ZIP) ---
+    else {
+      const zip = new JSZip();
+      const processedFiles = [];
+      const totalFiles = files.value.length;
+
+      for (let i = 0; i < totalFiles; i++) {
+        const item = files.value[i];
+        progressLabel.value = `Processing ${item.file.name}...`;
+
+        const convertedBlob = await processSingleImage(item.file);
+        const newName = item.file.name.replace(/\.[^/.]+$/, "") + '.' + ext;
+
+        processedFiles.push({ name: newName, blob: convertedBlob });
+        progress.value = ((i + 1) / totalFiles) * 90;
+      }
+
+      if (zipOutput.value || totalFiles > 1) {
+        progressLabel.value = "Compressing...";
+        processedFiles.forEach(f => zip.file(f.name, f.blob));
+        const content = await zip.generateAsync({ type: "blob" }, (metadata) => {
+          progress.value = 90 + (metadata.percent * 0.1);
+        });
+        triggerDownload(content, "converted_images.zip");
+      } else {
+        progressLabel.value = "Finalizing...";
+        progress.value = 100;
+        triggerDownload(processedFiles[0].blob, processedFiles[0].name);
+      }
     }
 
   } catch (e) {
     console.error(e);
-    errorMessage.value = "Conversion failed. " + e.message;
+    // Friendly error for missing delegates
+    if (e.message.includes("FailedToExecuteCommand") || e.message.includes("ffmpeg")) {
+      errorMessage.value = "This format requires external libraries (ffmpeg) not available in the browser. Please use GIF or WebP for animations.";
+    } else {
+      errorMessage.value = "Conversion failed. " + e.message;
+    }
   } finally {
     setTimeout(() => {
       processing.value = false;
@@ -157,6 +195,7 @@ const convertAndDownload = async () => {
   }
 };
 
+// Logic for single image conversion (Standard Mode)
 const processSingleImage = async (file) => {
   const arrayBuffer = await file.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
@@ -164,29 +203,8 @@ const processSingleImage = async (file) => {
   return new Promise((resolve, reject) => {
     try {
       ImageMagick.read(bytes, (image) => {
-        // Rotation
-        if (rotation.value !== 0) image.rotate(rotation.value);
-
-        // Resizing
-        if (resizeMode.value === 'percent') {
-          const p = resizePercent.value / 100;
-          image.resize(image.width * p, image.height * p);
-        }
-        else if (resizeMode.value === 'pixels') {
-          const w = resizeWidth.value ? parseInt(resizeWidth.value) : image.width;
-          const h = resizeHeight.value ? parseInt(resizeHeight.value) : image.height;
-          if (lockRatio.value) image.resize(w, h);
-          else {
-            const geom = new MagickGeometry(w, h);
-            geom.ignoreAspectRatio = true;
-            image.resize(geom);
-          }
-        }
-
-        // Format Setup
+        applyEdits(image);
         image.format = targetFormat.value;
-
-        // Output Generation (Standard Quality)
         image.quality = quality.value;
         image.write((data) => {
           resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
@@ -196,6 +214,74 @@ const processSingleImage = async (file) => {
       reject(err);
     }
   });
+};
+
+// Logic for Animation (MagickImageCollection)
+const processAnimation = async () => {
+  const collection = MagickImageCollection.create();
+
+  try {
+    for (let i = 0; i < files.value.length; i++) {
+      const file = files.value[i].file;
+      progressLabel.value = `Adding frame ${i + 1}/${files.value.length}`;
+      progress.value = (i / files.value.length) * 80;
+
+      const arrayBuffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+
+      // Create independent MagickImage for the frame
+      const image = MagickImage.create();
+      image.read(bytes);
+
+      applyEdits(image);
+
+      // Set Animation Delay (1 tick = 10ms approx)
+      image.animationDelay = Math.round(animationDelay.value / 10);
+
+      // Attempt to optimize for GIF/WebP
+      if (targetFormat.value === MagickFormat.Gif) {
+        image.gifDisposeMethod = 2; // Background
+      }
+
+      collection.push(image);
+    }
+
+    progressLabel.value = "Rendering Animation...";
+
+    // Optimize layers for GIF to reduce size
+    if (targetFormat.value === MagickFormat.Gif) {
+      collection.optimize();
+    }
+
+    return new Promise((resolve) => {
+      collection.write(targetFormat.value, (data) => {
+        resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
+      });
+    });
+
+  } finally {
+    collection.dispose();
+  }
+};
+
+// Shared Edit Logic (Resize/Rotate)
+const applyEdits = (image) => {
+  if (rotation.value !== 0) image.rotate(rotation.value);
+
+  if (resizeMode.value === 'percent') {
+    const p = resizePercent.value / 100;
+    image.resize(image.width * p, image.height * p);
+  }
+  else if (resizeMode.value === 'pixels') {
+    const w = resizeWidth.value ? parseInt(resizeWidth.value) : image.width;
+    const h = resizeHeight.value ? parseInt(resizeHeight.value) : image.height;
+    if (lockRatio.value) image.resize(w, h);
+    else {
+      const geom = new MagickGeometry(w, h);
+      geom.ignoreAspectRatio = true;
+      image.resize(geom);
+    }
+  }
 };
 
 const triggerDownload = (blob, filename) => {
@@ -345,6 +431,31 @@ const triggerDownload = (blob, filename) => {
               </div>
             </div>
 
+            <div v-if="canAnimate" class="bg-indigo-50 border border-indigo-100 rounded-xl p-4 transition-all">
+              <label class="flex items-center gap-3 cursor-pointer">
+                <div class="relative inline-flex items-center">
+                  <input type="checkbox" v-model="makeAnimation" class="sr-only peer">
+                  <div
+                    class="w-11 h-6 bg-gray-300 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-indigo-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600">
+                  </div>
+                </div>
+                <span class="text-sm font-bold text-indigo-900">Merge into Animation <span
+                    class="text-xs font-normal text-indigo-500">(GIF / WebP Only)</span></span>
+              </label>
+
+              <div v-if="makeAnimation" class="mt-3 pl-2 border-l-2 border-indigo-200 ml-2">
+                <label class="block text-xs font-semibold text-indigo-600 mb-1">Frame Delay (ms)</label>
+                <input type="number" v-model="animationDelay"
+                  class="w-full border border-indigo-200 rounded-lg py-1 px-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                  placeholder="e.g. 200" />
+                <p class="text-[10px] text-indigo-400 mt-1">Time between frames in milliseconds</p>
+              </div>
+            </div>
+
+            <div v-if="files.length > 1 && !canAnimate" class="text-xs text-gray-400 text-center italic">
+              Animation is only available for GIF and WebP formats.
+            </div>
+
             <div>
               <label class="block text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">Edit Image</label>
               <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 space-y-4">
@@ -412,7 +523,7 @@ const triggerDownload = (blob, filename) => {
               </div>
             </div>
 
-            <div>
+            <div v-if="!makeAnimation">
               <label
                 class="flex items-center gap-3 p-3 border border-gray-200 rounded-xl cursor-pointer hover:bg-gray-50 transition-colors">
                 <input type="checkbox" v-model="zipOutput"
@@ -431,7 +542,7 @@ const triggerDownload = (blob, filename) => {
             class="w-full mt-6 py-4 px-6 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white rounded-xl font-bold shadow-lg shadow-indigo-200 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform active:scale-[0.98] flex items-center justify-center gap-2">
             <span v-if="!isReady">Loading Engine...</span>
             <span v-else-if="processing">Running...</span>
-            <span v-else>Convert Images</span>
+            <span v-else>{{ makeAnimation ? 'Create Animation' : 'Convert Images' }}</span>
           </button>
         </div>
       </div>
