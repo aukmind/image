@@ -65,7 +65,6 @@ const currentMoreLabel = computed(() => Object.keys(extraFormats).find(key => ex
 
 // --- Logic Helpers ---
 
-// Check if Output format supports animation OR layers (like PDF pages)
 const isMultiFrameFormat = computed(() => {
   return [
     MagickFormat.Gif,
@@ -75,9 +74,6 @@ const isMultiFrameFormat = computed(() => {
   ].includes(targetFormat.value);
 });
 
-// "Merge into Animation" checkbox logic
-// We only allow merging if the output is actually animated (GIF/WebP). 
-// Merging into PDF is possible but usually users expect "Animation" to mean motion.
 const canMergeAnimation = computed(() => {
   if (files.value.length < 2) return false;
   return [MagickFormat.Gif, MagickFormat.WebP].includes(targetFormat.value);
@@ -92,7 +88,6 @@ watch(() => files.value.length, (newCount) => {
   if (newCount < 2) makeAnimation.value = false;
 });
 
-// Auto-Unlock Ratio
 watch([resizeWidth, resizeHeight], ([newW, newH]) => {
   if (newW && newH && resizeMode.value === 'pixels') {
     lockRatio.value = false;
@@ -121,18 +116,48 @@ const closeDropdown = () => { showMoreDropdown.value = false; };
 
 // --- File Handling ---
 const addFiles = (fileList) => {
-  const newFiles = Array.from(fileList).filter(f => f.type.startsWith('image/'));
-  const filesWithPreviews = newFiles.map(f => ({
+  const allFiles = Array.from(fileList);
+
+  const validFiles = [];
+  const rejectedNames = [];
+
+  // Separate valid images/PDFs from unsupported files
+  allFiles.forEach(f => {
+    if (f.type.startsWith('image/')) {
+      validFiles.push(f);
+    } else {
+      rejectedNames.push(f.name);
+    }
+  });
+
+  // 1. Report Rejected Files specifically
+  if (rejectedNames.length > 0) {
+    // Show up to 5 names, then "...and X more" to avoid huge messages
+    const displayNames = rejectedNames.slice(0, 5).join(', ');
+    const extraCount = rejectedNames.length - 5;
+    const suffix = extraCount > 0 ? `, and ${extraCount} others.` : '.';
+
+    errorMessage.value = `Skipped unsupported files: ${displayNames}${suffix}`;
+  } else {
+    errorMessage.value = '';
+  }
+
+  const filesWithPreviews = validFiles.map(f => ({
     file: f,
     id: Math.random().toString(36).substr(2, 9),
-    preview: URL.createObjectURL(f)
+    preview: URL.createObjectURL(f),
+    renderError: false
   }));
   files.value = [...files.value, ...filesWithPreviews];
-  errorMessage.value = '';
 };
 
 const removeFile = (id) => {
   files.value = files.value.filter(f => f.id !== id);
+};
+
+// 2. Handle Corrupt/Unsupported Preview Rendering
+const handlePreviewError = (fileItem) => {
+  fileItem.renderError = true;
 };
 
 const onDrop = (e) => {
@@ -159,14 +184,12 @@ const convertAndDownload = async () => {
     if (extraKey) ext = extraKey.toLowerCase();
     if (ext === 'jpeg') ext = 'jpg';
 
-    // Branch: MERGE multiple files into one animation
     if (makeAnimation.value && canMergeAnimation.value) {
       progressLabel.value = "Merging Animation...";
       const blob = await processMergeAnimation();
       progress.value = 100;
       triggerDownload(blob, `animation.${ext}`);
     }
-    // Branch: Process files individually (Handles Input GIFs -> Output GIFs/PDFs/PNGs)
     else {
       const zip = new JSZip();
       const processedFiles = [];
@@ -224,8 +247,6 @@ const processSingleImage = async (file) => {
 
     try {
       collection.read(bytes);
-
-      // Coalesce helps with GIFs, making every frame a full image
       collection.coalesce();
 
       for (let i = 0; i < collection.length; i++) {
@@ -235,21 +256,14 @@ const processSingleImage = async (file) => {
         image.quality = quality.value;
       }
 
-      // 1. If output supports multiple frames/pages (GIF, WebP, PDF), write the Collection.
-      // This ensures GIF->PDF creates a Multi-Page PDF.
       if (isMultiFrameFormat.value) {
         if (targetFormat.value === MagickFormat.Gif) collection.optimize();
-
         collection.write(targetFormat.value, (data) => {
           resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
         });
       }
-      // 2. If output is single-frame (PNG, JPG), flatten or take the first frame.
       else {
         const firstFrame = collection[0];
-
-        // FIX: We must EXPLICITLY pass targetFormat.value as the first argument to write().
-        // Otherwise, it might try to use the original GIF encoding or "Unknown", causing the crash.
         firstFrame.write(targetFormat.value, (data) => {
           resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
         });
@@ -406,7 +420,19 @@ const triggerDownload = (blob, filename) => {
               class="w-full h-full overflow-y-auto grid grid-cols-3 gap-2 content-start pr-2 pointer-events-none relative z-10">
               <div v-for="file in files" :key="file.id"
                 class="aspect-square relative group bg-white rounded-xl shadow-sm overflow-hidden border border-gray-200">
-                <img :src="file.preview" class="w-full h-full object-cover" />
+
+                <img v-if="!file.renderError" :src="file.preview" @error="handlePreviewError(file)"
+                  class="w-full h-full object-cover" />
+
+                <div v-else class="w-full h-full flex flex-col items-center justify-center bg-gray-50 p-2 text-center">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-gray-400 mb-1" fill="none"
+                    viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                  </svg>
+                  <span class="text-[10px] text-gray-500 font-medium truncate w-full">{{ file.file.name }}</span>
+                </div>
+
                 <button @click.stop.prevent="removeFile(file.id)"
                   class="absolute top-1 right-1 bg-black/60 text-white rounded-full p-1 opacity-40 group-hover:opacity-100 transition-opacity pointer-events-auto hover:bg-red-500">
                   <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
