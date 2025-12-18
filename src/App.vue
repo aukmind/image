@@ -6,9 +6,13 @@ import {
   MagickFormat,
   MagickGeometry,
   MagickImage,
-  MagickImageCollection
+  MagickImageCollection,
+  MagickColor
 } from '@imagemagick/magick-wasm';
 import JSZip from 'jszip';
+
+// --- Constants ---
+const GRAVITY_CENTER = 5;
 
 // --- State ---
 const isReady = ref(false);
@@ -59,23 +63,33 @@ const extraFormats = {
 const isMoreSelected = computed(() => Object.values(extraFormats).includes(targetFormat.value));
 const currentMoreLabel = computed(() => Object.keys(extraFormats).find(key => extraFormats[key] === targetFormat.value));
 
-// --- Animation Logic Update ---
-// APNG requires FFMPEG delegate which is missing in WASM. 
-// We strictly allow only GIF and WEBP for animations.
-const canAnimate = computed(() => {
-  if (files.value.length < 2) return false;
-  const animatableFormats = [MagickFormat.Gif, MagickFormat.WebP];
-  return animatableFormats.includes(targetFormat.value);
+// --- Logic Helpers ---
+
+// Check if Output format supports animation
+const isOutputAnimated = computed(() => {
+  return [MagickFormat.Gif, MagickFormat.WebP].includes(targetFormat.value);
 });
 
-// Auto-disable animation if format changes to non-supported
+// "Merge into Animation" checkbox logic
+const canMergeAnimation = computed(() => {
+  if (files.value.length < 2) return false;
+  return isOutputAnimated.value;
+});
+
 watch(targetFormat, () => {
-  if (!canAnimate.value) makeAnimation.value = false;
+  if (!canMergeAnimation.value) makeAnimation.value = false;
 });
 
 watch(() => files.value.length, (newCount) => {
   if (newCount > 1 && !makeAnimation.value) zipOutput.value = true;
   if (newCount < 2) makeAnimation.value = false;
+});
+
+// Auto-Unlock Ratio
+watch([resizeWidth, resizeHeight], ([newW, newH]) => {
+  if (newW && newH && resizeMode.value === 'pixels') {
+    lockRatio.value = false;
+  }
 });
 
 const selectFormat = (format) => {
@@ -131,7 +145,6 @@ const convertAndDownload = async () => {
   errorMessage.value = '';
 
   try {
-    // Determine extension
     let ext = 'dat';
     const quickKey = Object.keys(quickFormats).find(key => quickFormats[key] === targetFormat.value);
     if (quickKey) ext = quickKey.toLowerCase();
@@ -139,15 +152,14 @@ const convertAndDownload = async () => {
     if (extraKey) ext = extraKey.toLowerCase();
     if (ext === 'jpeg') ext = 'jpg';
 
-    // --- Branch A: Create Animation ---
-    if (makeAnimation.value && canAnimate.value) {
-      progressLabel.value = "Building Animation...";
-      const blob = await processAnimation();
+    // Branch: MERGE multiple files into one animation
+    if (makeAnimation.value && canMergeAnimation.value) {
+      progressLabel.value = "Merging Animation...";
+      const blob = await processMergeAnimation();
       progress.value = 100;
       triggerDownload(blob, `animation.${ext}`);
     }
-
-    // --- Branch B: Standard Processing (Single or Batch ZIP) ---
+    // Branch: Process files individually (Handles Input GIFs -> Output GIFs)
     else {
       const zip = new JSZip();
       const processedFiles = [];
@@ -157,9 +169,10 @@ const convertAndDownload = async () => {
         const item = files.value[i];
         progressLabel.value = `Processing ${item.file.name}...`;
 
+        // This function now handles Animated Inputs correctly
         const convertedBlob = await processSingleImage(item.file);
-        const newName = item.file.name.replace(/\.[^/.]+$/, "") + '.' + ext;
 
+        const newName = item.file.name.replace(/\.[^/.]+$/, "") + '.' + ext;
         processedFiles.push({ name: newName, blob: convertedBlob });
         progress.value = ((i + 1) / totalFiles) * 90;
       }
@@ -177,12 +190,12 @@ const convertAndDownload = async () => {
         triggerDownload(processedFiles[0].blob, processedFiles[0].name);
       }
     }
-
   } catch (e) {
     console.error(e);
-    // Friendly error for missing delegates
     if (e.message.includes("FailedToExecuteCommand") || e.message.includes("ffmpeg")) {
-      errorMessage.value = "This format requires external libraries (ffmpeg) not available in the browser. Please use GIF or WebP for animations.";
+      errorMessage.value = "This format requires external libraries (ffmpeg) not available. Please use GIF or WebP.";
+    } else if (e.message.includes("ImagesAreNotTheSameSize")) {
+      errorMessage.value = "GIF Error: Frames mismatch. Please ensure 'Resize' width/height are set if locking ratio.";
     } else {
       errorMessage.value = "Conversion failed. " + e.message;
     }
@@ -195,29 +208,58 @@ const convertAndDownload = async () => {
   }
 };
 
-// Logic for single image conversion (Standard Mode)
+// --- SINGLE FILE PROCESSOR (Handles Static OR Animated Input) ---
 const processSingleImage = async (file) => {
   const arrayBuffer = await file.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
 
   return new Promise((resolve, reject) => {
+    // We use Collection for everything. 
+    // If it's a JPG, collection has 1 frame. 
+    // If it's a GIF, collection has N frames.
+    const collection = MagickImageCollection.create();
+
     try {
-      ImageMagick.read(bytes, (image) => {
+      collection.read(bytes);
+
+      // COALESCE: Essential for resizing GIFs.
+      // Converts "delta" frames (partial updates) into full canvas frames.
+      // If we don't do this, resizing destroys the animation.
+      collection.coalesce();
+
+      for (let i = 0; i < collection.length; i++) {
+        const image = collection[i];
         applyEdits(image);
         image.format = targetFormat.value;
         image.quality = quality.value;
-        image.write((data) => {
+      }
+
+      // If output format supports animation, write the whole collection
+      if (isOutputAnimated.value) {
+        if (targetFormat.value === MagickFormat.Gif) collection.optimize();
+
+        collection.write(targetFormat.value, (data) => {
           resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
         });
-      });
+      }
+      // If output is static (JPG/PNG), just write the first frame
+      else {
+        const firstFrame = collection[0];
+        firstFrame.write((data) => {
+          resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
+        });
+      }
+
     } catch (err) {
       reject(err);
+    } finally {
+      collection.dispose();
     }
   });
 };
 
-// Logic for Animation (MagickImageCollection)
-const processAnimation = async () => {
+// --- MERGE ANIMATION PROCESSOR (Separate logic for merging multiple files) ---
+const processMergeAnimation = async () => {
   const collection = MagickImageCollection.create();
 
   try {
@@ -228,19 +270,23 @@ const processAnimation = async () => {
 
       const arrayBuffer = await file.arrayBuffer();
       const bytes = new Uint8Array(arrayBuffer);
-
-      // Create independent MagickImage for the frame
       const image = MagickImage.create();
       image.read(bytes);
 
       applyEdits(image);
 
-      // Set Animation Delay (1 tick = 10ms approx)
+      // Fix for "ImagesAreNotTheSameSize" when merging disparate images
+      if (targetFormat.value === MagickFormat.Gif && resizeMode.value === 'pixels' && resizeWidth.value && resizeHeight.value && lockRatio.value) {
+        const w = parseInt(resizeWidth.value);
+        const h = parseInt(resizeHeight.value);
+        image.backgroundColor = new MagickColor(0, 0, 0, 0);
+        image.extent(w, h, GRAVITY_CENTER);
+      }
+
       image.animationDelay = Math.round(animationDelay.value / 10);
 
-      // Attempt to optimize for GIF/WebP
       if (targetFormat.value === MagickFormat.Gif) {
-        image.gifDisposeMethod = 2; // Background
+        image.gifDisposeMethod = 2;
       }
 
       collection.push(image);
@@ -248,7 +294,6 @@ const processAnimation = async () => {
 
     progressLabel.value = "Rendering Animation...";
 
-    // Optimize layers for GIF to reduce size
     if (targetFormat.value === MagickFormat.Gif) {
       collection.optimize();
     }
@@ -264,7 +309,6 @@ const processAnimation = async () => {
   }
 };
 
-// Shared Edit Logic (Resize/Rotate)
 const applyEdits = (image) => {
   if (rotation.value !== 0) image.rotate(rotation.value);
 
@@ -275,8 +319,10 @@ const applyEdits = (image) => {
   else if (resizeMode.value === 'pixels') {
     const w = resizeWidth.value ? parseInt(resizeWidth.value) : image.width;
     const h = resizeHeight.value ? parseInt(resizeHeight.value) : image.height;
-    if (lockRatio.value) image.resize(w, h);
-    else {
+
+    if (lockRatio.value) {
+      image.resize(w, h);
+    } else {
       const geom = new MagickGeometry(w, h);
       geom.ignoreAspectRatio = true;
       image.resize(geom);
@@ -431,7 +477,7 @@ const triggerDownload = (blob, filename) => {
               </div>
             </div>
 
-            <div v-if="canAnimate" class="bg-indigo-50 border border-indigo-100 rounded-xl p-4 transition-all">
+            <div v-if="canMergeAnimation" class="bg-indigo-50 border border-indigo-100 rounded-xl p-4 transition-all">
               <label class="flex items-center gap-3 cursor-pointer">
                 <div class="relative inline-flex items-center">
                   <input type="checkbox" v-model="makeAnimation" class="sr-only peer">
@@ -452,7 +498,7 @@ const triggerDownload = (blob, filename) => {
               </div>
             </div>
 
-            <div v-if="files.length > 1 && !canAnimate" class="text-xs text-gray-400 text-center italic">
+            <div v-if="files.length > 1 && !isOutputAnimated" class="text-xs text-gray-400 text-center italic">
               Animation is only available for GIF and WebP formats.
             </div>
 
