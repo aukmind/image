@@ -27,10 +27,8 @@ const resizeHeight = ref(null);
 const lockRatio = ref(true);
 const rotation = ref(0);
 
-// --- Quality & Size Control ---
-const qualityMode = ref('percent');
+// --- Quality Control ---
 const quality = ref(90);
-const targetSizeKB = ref(200);
 
 // --- Formats Configuration ---
 const showMoreDropdown = ref(false);
@@ -188,44 +186,11 @@ const processSingleImage = async (file) => {
         // Format Setup
         image.format = targetFormat.value;
 
-        // Output Generation (Quality vs Target Size)
-        if (qualityMode.value === 'percent') {
-          // Standard: Use slider quality
-          image.quality = quality.value;
-          image.write((data) => {
-            resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
-          });
-        }
-        else {
-          // Advanced: Binary Search for Target Size
-          const targetBytes = targetSizeKB.value * 1024;
-          let min = 1;
-          let max = 100;
-          let bestData = null;
-
-          for (let i = 0; i < 6; i++) {
-            const mid = Math.floor((min + max) / 2);
-            image.quality = mid;
-
-            image.write((data) => {
-              if (data.length <= targetBytes) {
-                bestData = data;
-                min = mid + 1;
-              } else {
-                max = mid - 1;
-              }
-            });
-
-            if (min > max) break;
-          }
-
-          if (!bestData) {
-            image.quality = 1;
-            image.write((data) => bestData = data);
-          }
-
-          resolve(new Blob([bestData], { type: `image/${targetFormat.value}` }));
-        }
+        // Output Generation (Standard Quality)
+        image.quality = quality.value;
+        image.write((data) => {
+          resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
+        });
       });
     } catch (err) {
       reject(err);
@@ -369,39 +334,13 @@ const triggerDownload = (blob, filename) => {
                   </div>
                 </div>
 
-                <div class="pt-2 border-t border-gray-100">
-                  <div class="flex bg-gray-100 p-1 rounded-lg mb-3">
-                    <button @click="qualityMode = 'percent'"
-                      :class="['flex-1 py-1 text-xs font-bold rounded transition-all', qualityMode === 'percent' ? 'bg-white shadow text-indigo-600' : 'text-gray-500']">
-                      Fixed Quality
-                    </button>
-                    <button @click="qualityMode = 'size'"
-                      :class="['flex-1 py-1 text-xs font-bold rounded transition-all', qualityMode === 'size' ? 'bg-white shadow text-indigo-600' : 'text-gray-500']">
-                      Target Size
-                    </button>
-                  </div>
-
-                  <div v-if="qualityMode === 'percent'" class="flex items-center gap-3 px-1">
-                    <span class="text-xs text-gray-500 font-medium w-12">Level</span>
+                <div class="pt-4 border-t border-gray-100">
+                  <div class="flex items-center gap-3 px-1">
+                    <span class="text-xs text-gray-500 font-medium w-16">Quality</span>
                     <input type="range" v-model="quality" min="1" max="100"
                       class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
-                    <span class="w-12 text-right font-mono font-bold text-indigo-600 text-sm">{{ quality }}</span>
+                    <span class="w-12 text-right font-mono font-bold text-indigo-600 text-sm">{{ quality }}%</span>
                   </div>
-
-                  <div v-if="qualityMode === 'size'" class="flex items-center gap-3 px-1">
-                    <span class="text-xs text-gray-500 font-medium whitespace-nowrap">Max Size</span>
-                    <div class="flex-1 relative">
-                      <input type="number" v-model="targetSizeKB"
-                        class="w-full border border-gray-300 rounded-lg py-1 px-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none pr-8"
-                        placeholder="e.g. 200" />
-                      <span
-                        class="absolute right-3 top-1/2 transform -translate-y-1/2 text-xs text-gray-400 font-bold">KB</span>
-                    </div>
-                  </div>
-
-                  <p class="text-[10px] text-gray-400 mt-2 px-1 text-center" v-if="qualityMode === 'size'">
-                    *Approximated by reducing quality. If file remains larger, the lowest possible quality is used.
-                  </p>
                 </div>
               </div>
             </div>
@@ -443,7 +382,7 @@ const triggerDownload = (blob, filename) => {
                     <input type="range" v-model="resizePercent" min="1" max="200"
                       class="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
                     <span class="w-12 text-right font-mono font-bold text-indigo-600 text-sm">{{ resizePercent
-                      }}%</span>
+                    }}%</span>
                   </div>
 
                   <div v-if="resizeMode === 'pixels'" class="space-y-3">
