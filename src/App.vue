@@ -65,15 +65,22 @@ const currentMoreLabel = computed(() => Object.keys(extraFormats).find(key => ex
 
 // --- Logic Helpers ---
 
-// Check if Output format supports animation
-const isOutputAnimated = computed(() => {
-  return [MagickFormat.Gif, MagickFormat.WebP].includes(targetFormat.value);
+// Check if Output format supports animation OR layers (like PDF pages)
+const isMultiFrameFormat = computed(() => {
+  return [
+    MagickFormat.Gif,
+    MagickFormat.WebP,
+    MagickFormat.Pdf,
+    MagickFormat.Tiff
+  ].includes(targetFormat.value);
 });
 
 // "Merge into Animation" checkbox logic
+// We only allow merging if the output is actually animated (GIF/WebP). 
+// Merging into PDF is possible but usually users expect "Animation" to mean motion.
 const canMergeAnimation = computed(() => {
   if (files.value.length < 2) return false;
-  return isOutputAnimated.value;
+  return [MagickFormat.Gif, MagickFormat.WebP].includes(targetFormat.value);
 });
 
 watch(targetFormat, () => {
@@ -159,7 +166,7 @@ const convertAndDownload = async () => {
       progress.value = 100;
       triggerDownload(blob, `animation.${ext}`);
     }
-    // Branch: Process files individually (Handles Input GIFs -> Output GIFs)
+    // Branch: Process files individually (Handles Input GIFs -> Output GIFs/PDFs/PNGs)
     else {
       const zip = new JSZip();
       const processedFiles = [];
@@ -169,7 +176,6 @@ const convertAndDownload = async () => {
         const item = files.value[i];
         progressLabel.value = `Processing ${item.file.name}...`;
 
-        // This function now handles Animated Inputs correctly
         const convertedBlob = await processSingleImage(item.file);
 
         const newName = item.file.name.replace(/\.[^/.]+$/, "") + '.' + ext;
@@ -208,23 +214,18 @@ const convertAndDownload = async () => {
   }
 };
 
-// --- SINGLE FILE PROCESSOR (Handles Static OR Animated Input) ---
+// --- SINGLE FILE PROCESSOR ---
 const processSingleImage = async (file) => {
   const arrayBuffer = await file.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
 
   return new Promise((resolve, reject) => {
-    // We use Collection for everything. 
-    // If it's a JPG, collection has 1 frame. 
-    // If it's a GIF, collection has N frames.
     const collection = MagickImageCollection.create();
 
     try {
       collection.read(bytes);
 
-      // COALESCE: Essential for resizing GIFs.
-      // Converts "delta" frames (partial updates) into full canvas frames.
-      // If we don't do this, resizing destroys the animation.
+      // Coalesce helps with GIFs, making every frame a full image
       collection.coalesce();
 
       for (let i = 0; i < collection.length; i++) {
@@ -234,18 +235,22 @@ const processSingleImage = async (file) => {
         image.quality = quality.value;
       }
 
-      // If output format supports animation, write the whole collection
-      if (isOutputAnimated.value) {
+      // 1. If output supports multiple frames/pages (GIF, WebP, PDF), write the Collection.
+      // This ensures GIF->PDF creates a Multi-Page PDF.
+      if (isMultiFrameFormat.value) {
         if (targetFormat.value === MagickFormat.Gif) collection.optimize();
 
         collection.write(targetFormat.value, (data) => {
           resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
         });
       }
-      // If output is static (JPG/PNG), just write the first frame
+      // 2. If output is single-frame (PNG, JPG), flatten or take the first frame.
       else {
         const firstFrame = collection[0];
-        firstFrame.write((data) => {
+
+        // FIX: We must EXPLICITLY pass targetFormat.value as the first argument to write().
+        // Otherwise, it might try to use the original GIF encoding or "Unknown", causing the crash.
+        firstFrame.write(targetFormat.value, (data) => {
           resolve(new Blob([data], { type: `image/${targetFormat.value}` }));
         });
       }
@@ -258,7 +263,7 @@ const processSingleImage = async (file) => {
   });
 };
 
-// --- MERGE ANIMATION PROCESSOR (Separate logic for merging multiple files) ---
+// --- MERGE ANIMATION PROCESSOR ---
 const processMergeAnimation = async () => {
   const collection = MagickImageCollection.create();
 
@@ -275,7 +280,6 @@ const processMergeAnimation = async () => {
 
       applyEdits(image);
 
-      // Fix for "ImagesAreNotTheSameSize" when merging disparate images
       if (targetFormat.value === MagickFormat.Gif && resizeMode.value === 'pixels' && resizeWidth.value && resizeHeight.value && lockRatio.value) {
         const w = parseInt(resizeWidth.value);
         const h = parseInt(resizeHeight.value);
@@ -498,7 +502,7 @@ const triggerDownload = (blob, filename) => {
               </div>
             </div>
 
-            <div v-if="files.length > 1 && !isOutputAnimated" class="text-xs text-gray-400 text-center italic">
+            <div v-if="files.length > 1 && !isMultiFrameFormat" class="text-xs text-gray-400 text-center italic">
               Animation is only available for GIF and WebP formats.
             </div>
 
