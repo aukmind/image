@@ -418,6 +418,17 @@ body {
   min-width: 72px;
 }
 
+@media (max-width: 480px) {
+  .seg-control {
+    gap: 4px;
+  }
+  .seg-control > .format-btn {
+    padding: 8px 6px;
+    min-width: 0;
+    font-size: 12px;
+  }
+}
+
 .format-btn--select {
   appearance: none;
   -webkit-appearance: none;
@@ -536,6 +547,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   width: 100%;
 }

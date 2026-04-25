@@ -23,6 +23,15 @@ const MULTI_FRAME = new Set([MagickFormat.Gif, MagickFormat.WebP, MagickFormat.P
 const ANIMATION = new Set([MagickFormat.Gif, MagickFormat.WebP]);
 const CANVAS_OUTPUT = new Set([MagickFormat.Png, MagickFormat.Jpeg, MagickFormat.WebP]);
 const ANIMATABLE_INPUT = new Set(['image/gif', 'image/webp', 'image/apng']);
+const MIME_TO_FORMAT = {
+  'image/png': MagickFormat.Png,
+  'image/jpeg': MagickFormat.Jpeg,
+  'image/webp': MagickFormat.WebP,
+  'image/gif': MagickFormat.Gif,
+  'image/bmp': MagickFormat.Bmp,
+  'image/tiff': MagickFormat.Tiff,
+  'image/avif': MagickFormat.Avif
+};
 
 export const isMultiFrameFormat = (f) => MULTI_FRAME.has(f);
 export const isAnimationFormat = (f) => ANIMATION.has(f);
@@ -34,6 +43,12 @@ export function canUseCanvasPath(file, targetFormat) {
   // WebP-from-animatable would silently drop frames via canvas.
   if (targetFormat === MagickFormat.WebP && ANIMATABLE_INPUT.has(file.type)) return false;
   return true;
+}
+
+export function isPassthrough(file, opts) {
+  if (opts.rotation) return false;
+  if (opts.resizeMode && opts.resizeMode !== 'none') return false;
+  return MIME_TO_FORMAT[file.type] === opts.targetFormat;
 }
 
 function calcSize(opts, srcW, srcH) {
@@ -72,20 +87,54 @@ function writeBlob(target, format) {
   });
 }
 
+async function decodeAtSize(file, targetW, targetH) {
+  if (targetW && targetH) {
+    try {
+      return await createImageBitmap(file, {
+        resizeWidth: targetW,
+        resizeHeight: targetH,
+        resizeQuality: 'high'
+      });
+    } catch {
+      // Some browsers ignore options; fall through to full-size decode.
+    }
+  }
+  return createImageBitmap(file);
+}
+
 export async function processViaCanvas(file, opts) {
-  const bitmap = await createImageBitmap(file);
-  const s = calcSize(opts, bitmap.width, bitmap.height);
-  const w = Math.max(1, Math.round(s?.w ?? bitmap.width));
-  const h = Math.max(1, Math.round(s?.h ?? bitmap.height));
+  const knownExact = opts.resizeMode === 'pixels' && !opts.lockRatio
+    && opts.resizeWidth && opts.resizeHeight;
+
+  let bitmap, w, h;
+  if (knownExact) {
+    bitmap = await decodeAtSize(file, opts.resizeWidth, opts.resizeHeight);
+    w = bitmap.width;
+    h = bitmap.height;
+  } else {
+    const probe = await createImageBitmap(file);
+    const s = calcSize(opts, probe.width, probe.height);
+    w = Math.max(1, Math.round(s?.w ?? probe.width));
+    h = Math.max(1, Math.round(s?.h ?? probe.height));
+    if (w < probe.width || h < probe.height) {
+      probe.close?.();
+      bitmap = await decodeAtSize(file, w, h);
+    } else {
+      bitmap = probe;
+    }
+  }
 
   const rot = ((opts.rotation % 360) + 360) % 360;
   const swap = rot % 180 !== 0;
-  const canvas = document.createElement('canvas');
-  canvas.width = swap ? h : w;
-  canvas.height = swap ? w : h;
+  const canvasW = swap ? h : w;
+  const canvasH = swap ? w : h;
+  const useOffscreen = typeof OffscreenCanvas !== 'undefined';
+  const canvas = useOffscreen
+    ? new OffscreenCanvas(canvasW, canvasH)
+    : Object.assign(document.createElement('canvas'), { width: canvasW, height: canvasH });
   const ctx = canvas.getContext('2d');
   if (rot) {
-    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.translate(canvasW / 2, canvasH / 2);
     ctx.rotate(rot * Math.PI / 180);
     ctx.drawImage(bitmap, -w / 2, -h / 2, w, h);
   } else {
@@ -93,17 +142,36 @@ export async function processViaCanvas(file, opts) {
   }
   bitmap.close?.();
 
+  const mime = `image/${opts.targetFormat}`;
+  const q = opts.quality / 100;
+  if (useOffscreen && canvas.convertToBlob) {
+    return canvas.convertToBlob({ type: mime, quality: q });
+  }
   return new Promise((resolve, reject) => {
     canvas.toBlob(
       (b) => b ? resolve(b) : reject(new Error('Canvas encode failed')),
-      `image/${opts.targetFormat}`,
-      opts.quality / 100
+      mime,
+      q
     );
   });
 }
 
 export async function processSingleImage(file, opts) {
   const bytes = new Uint8Array(await file.arrayBuffer());
+
+  if (!isMultiFrameFormat(opts.targetFormat) && !ANIMATABLE_INPUT.has(file.type)) {
+    const image = MagickImage.create();
+    try {
+      image.read(bytes);
+      applyEdits(image, opts);
+      image.format = opts.targetFormat;
+      image.quality = opts.quality;
+      return await writeBlob(image, opts.targetFormat);
+    } finally {
+      image.dispose();
+    }
+  }
+
   const collection = MagickImageCollection.create();
   try {
     collection.read(bytes);

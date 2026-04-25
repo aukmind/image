@@ -4,6 +4,7 @@ import {
   isMultiFrameFormat,
   isAnimationFormat,
   canUseCanvasPath,
+  isPassthrough,
   processViaCanvas,
   processSingleImage,
   processMergeAnimation
@@ -191,6 +192,7 @@ const ImageApp = defineComponent({
     });
 
     const convertOne = async (file, opts) => {
+      if (isPassthrough(file, opts)) return file;
       if (canUseCanvasPath(file, opts.targetFormat)) {
         try { return await processViaCanvas(file, opts); }
         catch (e) { console.warn('Canvas path failed, falling back to WASM', e); }
