@@ -429,33 +429,6 @@ body {
   }
 }
 
-.format-btn--select {
-  appearance: none;
-  -webkit-appearance: none;
-  -moz-appearance: none;
-  text-align: center;
-  text-align-last: center;
-  padding-right: 22px;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='%234b5563' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='M2 2l4 4 4-4'/></svg>");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
-  background-size: 10px 6px;
-}
-
-.format-btn--select.format-btn--active {
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='white' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='M2 2l4 4 4-4'/></svg>");
-}
-
-.format-btn--select:focus {
-  outline: none;
-  border-color: #2563eb;
-}
-
-.format-btn--select option {
-  color: #1a1a2e;
-  background: #fff;
-}
-
 .callout {
   background: #eff6ff;
   border: 1px solid #dbeafe;

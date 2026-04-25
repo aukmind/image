@@ -1,41 +1,26 @@
 import {
-  ensureMagickReady,
-  MagickFormat,
-  isMultiFrameFormat,
-  isAnimationFormat,
-  canUseCanvasPath,
+  Format,
+  formatExtension,
+  isCanvasOutput,
   isPassthrough,
-  processViaCanvas,
-  processSingleImage,
-  processMergeAnimation
+  processInWorker,
+  preloadHeic
 } from './image-handler.js';
 import { expandPdfPages, bundleImagesToPdf } from './pdf-handler.js';
 
-const { createApp, defineComponent, ref, computed, watch, onMounted, onBeforeUnmount } = Vue;
+const { createApp, defineComponent, ref, onMounted, onBeforeUnmount } = Vue;
 const naive = window.naive;
 
 const QUICK_FORMATS = [
-  ['PNG', MagickFormat.Png],
-  ['JPG', MagickFormat.Jpeg],
-  ['GIF', MagickFormat.Gif],
-  ['WEBP', MagickFormat.WebP],
-  ['PDF', MagickFormat.Pdf],
-  ['BMP', MagickFormat.Bmp],
-  ['ICO', MagickFormat.Ico]
-];
-const EXTRA_FORMATS = [
-  ['TIFF', MagickFormat.Tiff],
-  ['AVIF', MagickFormat.Avif],
-  ['TGA', MagickFormat.Tga],
-  ['DDS', MagickFormat.Dds]
+  ['PNG', Format.Png],
+  ['JPG', Format.Jpeg],
+  ['WEBP', Format.WebP],
+  ['PDF', Format.Pdf]
 ];
 
-const toOptions = (entries) => entries.map(([label, value]) => ({ label, value }));
-const quickFormatList = toOptions(QUICK_FORMATS);
-const extraFormatOptions = toOptions(EXTRA_FORMATS);
-const extraFormatSet = new Set(EXTRA_FORMATS.map(([, v]) => v));
+const quickFormatList = QUICK_FORMATS.map(([label, value]) => ({ label, value }));
 
-const formatExtension = (format) => format === MagickFormat.Jpeg ? 'jpg' : format;
+const HEIC_EXT = /\.(hei[cf]|hif)$/i;
 
 const triggerDownload = (blob, filename) => {
   const url = URL.createObjectURL(blob);
@@ -48,20 +33,11 @@ const triggerDownload = (blob, filename) => {
   URL.revokeObjectURL(url);
 };
 
-const friendlyError = (msg) => {
-  if (msg.includes('FailedToExecuteCommand') || msg.includes('ffmpeg'))
-    return 'This format requires external libraries (ffmpeg) not available. Please use GIF or WebP.';
-  if (msg.includes('ImagesAreNotTheSameSize'))
-    return "GIF Error: Frames mismatch. Please ensure 'Resize' width/height are set if locking ratio.";
-  return 'Conversion failed. ' + msg;
-};
-
 const ImageApp = defineComponent({
   template: '#image-app-template',
   setup() {
     const message = naive.useMessage();
 
-    const isReady = ref(false);
     const processing = ref(false);
     const progress = ref(0);
     const progressLabel = ref('');
@@ -70,10 +46,8 @@ const ImageApp = defineComponent({
     const files = ref([]);
     const isDragging = ref(false);
 
-    const targetFormat = ref(MagickFormat.Png);
+    const targetFormat = ref(Format.Png);
     const quality = ref(90);
-    const makeAnimation = ref(false);
-    const animationDelay = ref(200);
 
     const resizeMode = ref('none');
     const resizePercent = ref(50);
@@ -88,25 +62,9 @@ const ImageApp = defineComponent({
       { label: 'Pixels', value: 'pixels' }
     ];
 
-    const isExtraFormatActive = computed(() => extraFormatSet.has(targetFormat.value));
-    const isMultiFrame = computed(() => isMultiFrameFormat(targetFormat.value));
-    const canMergeAnimation = computed(() =>
-      files.value.length >= 2 && isAnimationFormat(targetFormat.value)
-    );
-
-    watch(canMergeAnimation, (ok) => { if (!ok) makeAnimation.value = false; });
-
-    const loadEngine = async () => {
-      if (isReady.value) return;
-      await ensureMagickReady();
-      isReady.value = true;
-    };
-
     onMounted(() => {
-      const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 1500));
-      idle(() => loadEngine().catch((e) => {
-        errorMessage.value = 'Failed to load Magick: ' + e.message;
-      }));
+      const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 1000));
+      idle(() => preloadHeic().catch(() => {}));
     });
 
     onBeforeUnmount(() => {
@@ -120,7 +78,10 @@ const ImageApp = defineComponent({
       renderError: false
     });
 
-    const isAccepted = (f) => f.type.startsWith('image/') || f.type === 'application/pdf';
+    const isAccepted = (f) =>
+      f.type.startsWith('image/') ||
+      f.type === 'application/pdf' ||
+      HEIC_EXT.test(f.name || '');
 
     const addFiles = async (fileList) => {
       const incoming = Array.from(fileList);
@@ -187,18 +148,12 @@ const ImageApp = defineComponent({
       resizePercent: resizePercent.value,
       resizeWidth: resizeWidth.value,
       resizeHeight: resizeHeight.value,
-      lockRatio: lockRatio.value,
-      animationDelay: animationDelay.value
+      lockRatio: lockRatio.value
     });
 
-    const convertOne = async (file, opts) => {
-      if (isPassthrough(file, opts)) return file;
-      if (canUseCanvasPath(file, opts.targetFormat)) {
-        try { return await processViaCanvas(file, opts); }
-        catch (e) { console.warn('Canvas path failed, falling back to WASM', e); }
-      }
-      await loadEngine();
-      return processSingleImage(file, opts);
+    const convertOne = (file, opts) => {
+      if (isPassthrough(file, opts)) return Promise.resolve(file);
+      return processInWorker(file, opts);
     };
 
     const convertAndDownload = async () => {
@@ -210,58 +165,41 @@ const ImageApp = defineComponent({
       try {
         const opts = buildOpts();
         const ext = formatExtension(opts.targetFormat);
-        const merging = makeAnimation.value && canMergeAnimation.value;
-        const targetIsPdf = opts.targetFormat === MagickFormat.Pdf;
+        const targetIsPdf = opts.targetFormat === Format.Pdf;
+        const stepOpts = targetIsPdf ? { ...opts, targetFormat: Format.Jpeg } : opts;
+        const stepCap = targetIsPdf ? 80 : 100;
+        const total = files.value.length;
+        const processed = [];
 
-        if (merging) {
-          progressLabel.value = 'Loading engine...';
-          await loadEngine();
-          progressLabel.value = 'Merging Animation...';
-          const blob = await processMergeAnimation(
-            files.value.map(f => f.file),
-            opts,
-            (i, total) => {
-              progressLabel.value = `Adding frame ${i + 1}/${total}`;
-              progress.value = (i / total) * 100;
-            }
+        for (let i = 0; i < total; i++) {
+          const item = files.value[i];
+          progressLabel.value = `Processing ${item.file.name}...`;
+          const blob = await convertOne(item.file, stepOpts);
+          const newName = item.file.name.replace(/\.[^/.]+$/, '') + '.' + ext;
+          processed.push({ name: newName, blob });
+          progress.value = ((i + 1) / total) * stepCap;
+        }
+
+        if (targetIsPdf) {
+          progressLabel.value = 'Building PDF...';
+          const pdfBlob = await bundleImagesToPdf(
+            processed.map(p => p.blob),
+            (i, t) => { progress.value = 80 + (i / t) * 20; }
           );
-          progress.value = 100;
-          triggerDownload(blob, `animation.${ext}`);
+          triggerDownload(pdfBlob, 'document.pdf');
+        } else if (total > 1) {
+          progressLabel.value = 'Compressing...';
+          const zip = new JSZip();
+          processed.forEach(p => zip.file(p.name, p.blob));
+          const content = await zip.generateAsync({ type: 'blob' });
+          triggerDownload(content, 'converted_images.zip');
         } else {
-          const total = files.value.length;
-          const stepOpts = targetIsPdf ? { ...opts, targetFormat: MagickFormat.Jpeg } : opts;
-          const stepCap = targetIsPdf ? 80 : 100;
-          const processed = [];
-          for (let i = 0; i < total; i++) {
-            const item = files.value[i];
-            progressLabel.value = `Processing ${item.file.name}...`;
-            const blob = await convertOne(item.file, stepOpts);
-            const newName = item.file.name.replace(/\.[^/.]+$/, '') + '.' + ext;
-            processed.push({ name: newName, blob });
-            progress.value = ((i + 1) / total) * stepCap;
-          }
-
-          if (targetIsPdf) {
-            progressLabel.value = 'Building PDF...';
-            const pdfBlob = await bundleImagesToPdf(
-              processed.map(p => p.blob),
-              (i, t) => { progress.value = 80 + (i / t) * 20; }
-            );
-            triggerDownload(pdfBlob, 'document.pdf');
-          } else if (total > 1) {
-            progressLabel.value = 'Compressing...';
-            const zip = new JSZip();
-            processed.forEach(p => zip.file(p.name, p.blob));
-            const content = await zip.generateAsync({ type: 'blob' });
-            triggerDownload(content, 'converted_images.zip');
-          } else {
-            triggerDownload(processed[0].blob, processed[0].name);
-          }
+          triggerDownload(processed[0].blob, processed[0].name);
         }
         message.success('Conversion complete!');
       } catch (e) {
         console.error(e);
-        errorMessage.value = friendlyError(e.message);
+        errorMessage.value = 'Conversion failed. ' + (e.message || e);
       } finally {
         processing.value = false;
         progress.value = 0;
@@ -270,14 +208,11 @@ const ImageApp = defineComponent({
     };
 
     return {
-      isReady, processing, progress, progressLabel, errorMessage,
+      processing, progress, progressLabel, errorMessage,
       files, isDragging,
       targetFormat, quality,
-      makeAnimation, animationDelay,
       resizeMode, resizePercent, resizeWidth, resizeHeight, lockRatio, rotation,
-      resizeModeOptions, quickFormatList, extraFormatOptions, isExtraFormatActive,
-      isMultiFrameFormat: isMultiFrame,
-      canMergeAnimation,
+      resizeModeOptions, quickFormatList,
       addFiles, removeFile, handlePreviewError, onDrop,
       rotateLeft, rotateRight,
       convertAndDownload
