@@ -1,0 +1,8 @@
+{
+  "name": "image-toolbox",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "type": "module"
+}
